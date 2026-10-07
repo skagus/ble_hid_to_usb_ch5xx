@@ -811,10 +811,11 @@ static void centralProcessGATTMsg(gattMsgEvent_t* pMsg)
     {
         uint8_t len = pMsg->msg.handleValueNoti.len;
         uint8_t* p = pMsg->msg.handleValueNoti.pValue;
-
+#if 0
         PRINT("[hdl=%04X] len=%d : ", pMsg->msg.handleValueNoti.handle, len);
         for(uint8_t k = 0; k < len; k++) PRINT("%02X ", p[k]);
         PRINT("\n");
+#endif
         DevHIDKeyReport(p);
     }
     /* Discovery 응답이면 별도 처리 함수로 위임 */
@@ -998,6 +999,13 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
             centralConnHandle = GAP_CONNHANDLE_INIT;
             centralDiscState = BLE_DISC_STATE_IDLE;
             centralCharHdl = 0;
+            
+            centralReportFound = FALSE;
+            centralCCCDHdl = 0;
+            centralSvcStartHdl = 0;
+            centralSvcEndHdl = 0;
+            centralBonded = FALSE;
+
             centralScanRes = 0;
             centralProcedureInProgress = FALSE;
 
@@ -1185,6 +1193,8 @@ static void centralStartDiscovery(void)
 
     centralSvcStartHdl = centralSvcEndHdl = centralCharHdl = 0;
     centralCCCDHdl = 0;
+    centralReportFound = FALSE;    // ★ 추가
+    centralBonded = FALSE;         // ★ 추가 (페어링 상태 재판정)
 
     centralDiscState = BLE_DISC_STATE_SVC;
 
