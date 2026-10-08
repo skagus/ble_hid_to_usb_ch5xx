@@ -4,7 +4,7 @@ GNU_PREF = riscv-none-embed-
 # PREFIX ?= riscv-none-embed-
 CC := $(GNU_PREF)gcc
 
-CHIP ?= CH573
+CHIP ?= CH582
 
 
 # All of the sources participating in the build are defined here

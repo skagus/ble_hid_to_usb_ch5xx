@@ -246,6 +246,7 @@ static uint8_t centralIsBleMouse(uint8_t* pData, uint8_t dataLen);
 static uint8_t centralIsBleKeyboard(uint8_t* pData, uint8_t dataLen);
 
 static uint8_t centralIsBondedDevice(uint8_t* pAddr, uint8_t addrType);
+static void centralSendKeyRelease(void);
 
 /*********************************************************************
  * PROFILE CALLBACKS
@@ -533,6 +534,13 @@ uint16_t Central_ProcessEvent(uint8_t task_id, uint16_t events)
 
         return (events ^ START_PAIRING_MODE_EVT);
     }
+
+    if(events & SEND_KEY_RELEASE_EVT)
+    {
+        centralSendKeyRelease();
+        return (events ^ SEND_KEY_RELEASE_EVT);
+    }
+
     /* 알 수 없는 이벤트는 무시 */
     return 0;
 }
@@ -816,7 +824,7 @@ static void centralProcessGATTMsg(gattMsgEvent_t* pMsg)
         for(uint8_t k = 0; k < len; k++) PRINT("%02X ", p[k]);
         PRINT("\n");
 #endif
-        DevHIDKeyReport(p);
+        DevHIDKeyReport(p, len);
     }
     /* Discovery 응답이면 별도 처리 함수로 위임 */
     else if(centralDiscState != BLE_DISC_STATE_IDLE)
@@ -864,6 +872,19 @@ static void centralHciMTUChangeCB(uint16_t connHandle, uint16_t maxTxOctets, uin
     GATT_ExchangeMTU(connHandle, &req, centralTaskId);
     PRINT("exchange mtu:%d\n", maxRxOctets);
     centralProcedureInProgress = TRUE;
+}
+
+/*********************************************************************
+ * @fn      centralSendKeyRelease
+ *
+ * @brief   연결 해제/모드 전환 시 눌린 키를 모두 해제하기 위해
+ *          all-zero HID 리포트를 USB 로 전송한다.
+ */
+static void centralSendKeyRelease(void)
+{
+    uint8_t allZero[HID_KEYBOARD_REPORT_LEN] = {0};
+
+    DevHIDKeyReport(allZero, HID_KEYBOARD_REPORT_LEN);
 }
 
 /*********************************************************************
@@ -1011,8 +1032,12 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
 
             tmos_stop_task(centralTaskId, START_READ_RSSI_EVT);
 
+            centralSendKeyRelease();   // 연결 해제 시 눌린 키 모두 해제
+
             PRINT("Disconnected...Reason:%x\n", pEvent->linkTerminate.reason);
             PRINT("Discovering...\n");
+
+            tmos_start_task(centralTaskId, SEND_KEY_RELEASE_EVT, 80 /* 50ms */); // 연결 해제 후 50ms 뒤에 키 릴리즈 전송, 못 보냈을 때 대비.
 
             /* ★ 항상 재스캔 */
             GAPRole_CentralStartDiscovery(DEFAULT_DISCOVERY_MODE,
@@ -1039,24 +1064,20 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
         /* 확장 광고(Extended Advertising) 수신 */
         case GAP_EXT_ADV_DEVICE_INFO_EVENT:
         {
+            gapExtAdvDeviceInfoEvent_t* extAdv =
+                (gapExtAdvDeviceInfoEvent_t*)pEvent;   /* ★ cast */
+
             PRINT("Recv ext adv \n");
 
-            /* ★ PAIRED_ONLY 모드에서는 본딩된 디바이스만 후보로 등록 */
             if(centralMode == CENTRAL_MODE_PAIRED_ONLY)
             {
-                if(!centralIsBondedDevice(pEvent->deviceInfo.addr,
-                                          pEvent->deviceInfo.addrType))
-                {
-                    break;   // 본딩 안 된 디바이스는 무시
-                }
+                if(!centralIsBondedDevice(extAdv->addr, extAdv->addrType))
+                    break;
             }
 
-            /* 마우스일 때만 리스트에 추가 */
-            if(centralIsBleKeyboard(pEvent->deviceInfo.pEvtData,
-                                    pEvent->deviceInfo.dataLen))
+            if(centralIsBleKeyboard(extAdv->pEvtData, extAdv->dataLen))
             {
-                centralAddDeviceInfo(pEvent->deviceInfo.addr,
-                                     pEvent->deviceInfo.addrType);
+                centralAddDeviceInfo(extAdv->addr, extAdv->addrType);
             }
         }
         break;
@@ -1316,28 +1337,35 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
     /* ---------- 3단계 : CCCD 찾기 ---------- */
     else if(centralDiscState == BLE_DISC_STATE_CCCD)
     {
-        if(pMsg->method == ATT_READ_BY_TYPE_RSP &&
-           pMsg->msg.readByTypeRsp.numPairs > 0)
+        if(pMsg->method == ATT_READ_BY_TYPE_RSP)
         {
-            centralCCCDHdl = BUILD_UINT16(pMsg->msg.readByTypeRsp.pDataList[0],
-                                          pMsg->msg.readByTypeRsp.pDataList[1]);
-            PRINT("Report CCCD handle : %x\n", centralCCCDHdl);
+           if(pMsg->msg.readByTypeRsp.numPairs > 0)
+            {
+                centralCCCDHdl = BUILD_UINT16(pMsg->msg.readByTypeRsp.pDataList[0],
+                                            pMsg->msg.readByTypeRsp.pDataList[1]);
+                PRINT("Report CCCD handle : %x\n", centralCCCDHdl);
 
-            /* ★ 여기서는 바로 쓰지 않는다.
-             *   페어링이 이미 끝난 상태(재연결)라면 바로 쓰고,
-             *   아니면 centralPairStateCB 에서 쓰도록 미룬다. */
-            if(centralBonded)
-            {
-                centralProcedureInProgress = FALSE;
-                tmos_start_task(centralTaskId, START_WRITE_CCCD_EVT,
-                                DEFAULT_WRITE_CCCD_DELAY);
+                /* ★ 여기서는 바로 쓰지 않는다.
+                *   페어링이 이미 끝난 상태(재연결)라면 바로 쓰고,
+                *   아니면 centralPairStateCB 에서 쓰도록 미룬다. */
+                if(centralBonded)
+                {
+                    centralProcedureInProgress = FALSE;
+                    tmos_start_task(centralTaskId, START_WRITE_CCCD_EVT,
+                                    DEFAULT_WRITE_CCCD_DELAY);
+                }
+                else
+                {
+                    PRINT("Wait pairing before CCCD write...\n");
+                }
             }
-            else
-            {
-                PRINT("Wait pairing before CCCD write...\n");
-            }
+            centralDiscState = BLE_DISC_STATE_IDLE;
         }
-        centralDiscState = BLE_DISC_STATE_IDLE;
+        else if(pMsg->method == ATT_ERROR_RSP)
+        {
+            PRINT("CCCD not found\n");
+            centralDiscState = BLE_DISC_STATE_IDLE;
+        }
     }
 }
 

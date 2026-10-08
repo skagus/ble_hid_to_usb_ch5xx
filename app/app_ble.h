@@ -53,6 +53,7 @@ extern "C" {
 #define ESTABLISH_LINK_TIMEOUT_EVT    0x0200
 #define START_PAIRING_MODE_EVT        0x0400   // ★ B22 눌림
 #define B22_DEBOUNCE_EVT              0x0800   // ★ 버튼 디바운스
+#define SEND_KEY_RELEASE_EVT          0x1000 
 
        /* Appearance 값들 */
 #define APPEARANCE_HID_MOUSE    0x03C2   /* HID Mouse */

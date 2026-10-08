@@ -1,5 +1,6 @@
 
 #include "com.h"
+#include "app_usb.h"
 
 #define DevEP0SIZE    0x40
 // Device descriptor
@@ -544,10 +545,15 @@ void DevHIDMouseReport(uint8_t mouse)
  *
  * @return  none
  */
-void DevHIDKeyReport(uint8_t* aKey)
+void DevHIDKeyReport(uint8_t* aKey, uint8_t nLen)
 {
-    memcpy(pEP1_IN_DataBuf, aKey, sizeof(HIDKey));
-    DevEP1_IN_Deal(sizeof(HIDKey));
+    if(nLen >= HID_KEYBOARD_REPORT_LEN) nLen = HID_KEYBOARD_REPORT_LEN;
+    else
+    {
+        memset(pEP1_IN_DataBuf, 0, HID_KEYBOARD_REPORT_LEN);
+    }
+    memcpy(pEP1_IN_DataBuf, aKey, nLen);
+    DevEP1_IN_Deal(HID_KEYBOARD_REPORT_LEN);
 }
 
 /*********************************************************************
