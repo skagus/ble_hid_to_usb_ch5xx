@@ -114,6 +114,16 @@
 /* ★ B22 디바운스 지연 (0.625ms 단위 → 200ms) */
 #define B22_DEBOUNCE_DELAY                  320
 
+/* ★ LED 상태 표시용 */
+#define LED_PIN                     GPIO_Pin_8     /* PA8 */
+#define LED_ON()                    GPIOA_ResetBits(LED_PIN)
+#define LED_OFF()                   GPIOA_SetBits(LED_PIN)
+#define LED_TOGGLE()                GPIOA_InverseBits(LED_PIN)
+
+/* 점멸 주기 (0.625ms 단위) */
+#define LED_BLINK_SLOW              800     /* 800 * 0.625ms = 500ms */
+#define LED_BLINK_FAST              160     /* 160 * 0.625ms = 100ms */
+
 /*
  * 애플리케이션(BLE 링크) 상태
  * IDLE          : 유휴(스캔 중이거나 미연결)
@@ -301,6 +311,10 @@ void Central_Init()
     GPIOB_ITModeCfg(GPIO_Pin_22, GPIO_ITMode_FallEdge);
     PFIC_EnableIRQ(GPIO_B_IRQn);
 
+    GPIOA_ModeCfg(GPIO_Pin_8, GPIO_ModeOut_PP_5mA);
+    LED_ON();
+    /* LED 상태 표시 태스크 시작 */
+
     centralTaskId = TMOS_ProcessEventRegister(Central_ProcessEvent);
 
     // Setup GAP
@@ -332,6 +346,7 @@ void Central_Init()
 
     /* 디바이스 시작 이벤트를 예약 → 이벤트 루프에서 START_DEVICE_EVT 처리 */
     tmos_set_event(centralTaskId, START_DEVICE_EVT);
+    tmos_start_task(centralTaskId, LED_UPDATE_EVT, LED_BLINK_SLOW);
 }
 
 /*********************************************************************
@@ -539,6 +554,49 @@ uint16_t Central_ProcessEvent(uint8_t task_id, uint16_t events)
     {
         centralSendKeyRelease();
         return (events ^ SEND_KEY_RELEASE_EVT);
+    }
+
+    if(events & LED_UPDATE_EVT)
+    {
+        static uint8_t ledOn = FALSE;
+        uint16_t nextPeriod;
+
+        switch(centralState)
+        {
+            case BLE_STATE_IDLE:
+                /* 스캔 중 → 느린 점멸 */
+                ledOn = !ledOn;
+                if(ledOn) LED_ON(); else LED_OFF();
+                if(centralMode == CENTRAL_MODE_PAIRING)
+                    nextPeriod = LED_BLINK_FAST;   /* 페어링 모드에서는 빠른 점멸 */
+                else
+                    nextPeriod = LED_BLINK_SLOW;
+                break;
+
+            case BLE_STATE_CONNECTING:
+                /* 연결 시도 중 → 빠른 점멸 */
+                ledOn = !ledOn;
+                if(ledOn) LED_ON(); else LED_OFF();
+                nextPeriod = LED_BLINK_FAST;
+                break;
+
+            case BLE_STATE_CONNECTED:
+                /* 연결됨 → 계속 켜짐 */
+                LED_ON();
+                ledOn = TRUE;
+                nextPeriod = LED_BLINK_SLOW;   /* 상태 변화 감지용 재진입 주기 */
+                break;
+
+            case BLE_STATE_DISCONNECTING:
+            default:
+                LED_OFF();
+                ledOn = FALSE;
+                nextPeriod = LED_BLINK_SLOW;
+                break;
+        }
+
+        tmos_start_task(centralTaskId, LED_UPDATE_EVT, nextPeriod);
+        return (events ^ LED_UPDATE_EVT);
     }
 
     /* 알 수 없는 이벤트는 무시 */

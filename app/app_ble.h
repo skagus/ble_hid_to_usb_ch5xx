@@ -32,7 +32,6 @@ extern "C" {
        *
        * START_DEVICE_EVT          : BLE 스택 초기화 후 디바이스(스캔) 시작
        * START_DISCOVERY_EVT       : (예약) 디바이스 탐색 시작
-       * START_SCAN_EVT            : (예약) 스캔 시작
        * START_SVC_DISCOVERY_EVT   : 연결 후 서비스(Service) 탐색 시작
        * START_PARAM_UPDATE_EVT    : 연결 파라미터 갱신 요청
        * START_PHY_UPDATE_EVT      : PHY(물리계층) 갱신 요청 (1M → 2M 등)
@@ -43,7 +42,6 @@ extern "C" {
        */
 #define START_DEVICE_EVT              0x0001
 #define START_DISCOVERY_EVT           0x0002
-#define START_SCAN_EVT                0x0004
 #define START_SVC_DISCOVERY_EVT       0x0008
 #define START_PARAM_UPDATE_EVT        0x0010
 #define START_PHY_UPDATE_EVT          0x0020
@@ -53,7 +51,8 @@ extern "C" {
 #define ESTABLISH_LINK_TIMEOUT_EVT    0x0200
 #define START_PAIRING_MODE_EVT        0x0400   // ★ B22 눌림
 #define B22_DEBOUNCE_EVT              0x0800   // ★ 버튼 디바운스
-#define SEND_KEY_RELEASE_EVT          0x1000 
+#define LED_UPDATE_EVT                0x1000 
+#define SEND_KEY_RELEASE_EVT          0x2000 
 
        /* Appearance 값들 */
 #define APPEARANCE_HID_MOUSE    0x03C2   /* HID Mouse */
