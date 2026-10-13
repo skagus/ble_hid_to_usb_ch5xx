@@ -228,14 +228,37 @@ static uint8_t centralDoWrite = TRUE;
 static uint8_t centralProcedureInProgress = FALSE;
 
 
-/* 첫 번째 Notify 가능 Report(0x2A4D) 를 저장하기 위한 플래그 */
+/* 첫 번째 Notify 가능 Report(0x2A4D) 또는 Boot Keyboard Report(0x2A22) 를 저장하기 위한 플래그 */
 static uint8_t centralReportFound = FALSE;
+static uint8_t centralIsBootKbd = FALSE;
+static uint16_t centralCharEndHdl = 0;
 
 /* 페어링(암호화) 완료 여부 */
 static uint8_t centralBonded = FALSE;
 
 /* ★ 현재 동작 모드 */
 static uint8_t centralMode = CENTRAL_MODE_PAIRED_ONLY;
+
+/* Advertising 및 Scan Response 정보 결합을 위한 캐시 구조체 */
+#define SCAN_FLAG_HID_SVC         0x01
+#define SCAN_FLAG_KEYBOARD_APP    0x02
+#define SCAN_FLAG_KEYBOARD_NAME   0x04
+#define SCAN_CACHE_MAX            8
+
+typedef struct {
+    uint8_t addr[B_ADDR_LEN];
+    uint8_t addrType;
+    uint8_t flags;
+} scan_adv_cache_t;
+
+static scan_adv_cache_t sScanCache[SCAN_CACHE_MAX];
+static uint8_t sScanCacheCount = 0;
+
+static void centralResetScanCache(void)
+{
+    sScanCacheCount = 0;
+    tmos_memset(sScanCache, 0, sizeof(sScanCache));
+}
 
 /*********************************************************************
  * LOCAL FUNCTIONS
@@ -253,7 +276,7 @@ static void centralStartDiscovery(void);
 static void centralAddDeviceInfo(uint8_t* pAddr, uint8_t addrType);
 
 static uint8_t centralIsBleMouse(uint8_t* pData, uint8_t dataLen);
-static uint8_t centralIsBleKeyboard(uint8_t* pData, uint8_t dataLen);
+static uint8_t centralCheckAndCacheKeyboard(uint8_t* pAddr, uint8_t addrType, uint8_t* pData, uint8_t dataLen);
 
 static uint8_t centralIsBondedDevice(uint8_t* pAddr, uint8_t addrType);
 static void centralSendKeyRelease(void);
@@ -623,15 +646,13 @@ static void central_ProcessTMOSMsg(tmos_event_hdr_t* pMsg)
     }
 }
 
-static uint8_t centralIsBleKeyboard(uint8_t* pData, uint8_t dataLen)
+static uint8_t centralParseScanData(uint8_t* pData, uint8_t dataLen)
 {
     uint8_t  i = 0;
-    uint8_t  hasHidSvc = FALSE;
-    uint8_t  isKeyboardAppear = FALSE;
-    uint8_t  nameIsKeyboard = FALSE;
+    uint8_t  flags = 0;
 
     if(pData == NULL || dataLen == 0)
-        return FALSE;
+        return 0;
 
     while(i < dataLen)
     {
@@ -650,7 +671,7 @@ static uint8_t centralIsBleKeyboard(uint8_t* pData, uint8_t dataLen)
                 {
                     uint16_t uuid = pData[i + 2 + j] | (pData[i + 3 + j] << 8);
                     if(uuid == HID_SERVICE_UUID)
-                        hasHidSvc = TRUE;
+                        flags |= SCAN_FLAG_HID_SVC;
                 }
                 break;
             }
@@ -661,7 +682,7 @@ static uint8_t centralIsBleKeyboard(uint8_t* pData, uint8_t dataLen)
                 {
                     uint16_t appear = pData[i + 2] | (pData[i + 3] << 8);
                     if(appear == APPEARANCE_HID_KEYBOARD)   // 0x03C1
-                        isKeyboardAppear = TRUE;
+                        flags |= SCAN_FLAG_KEYBOARD_APP;
                 }
                 break;
             }
@@ -681,7 +702,7 @@ static uint8_t centralIsBleKeyboard(uint8_t* pData, uint8_t dataLen)
                        (pData[i + 8 + j] == 'r' || pData[i + 8 + j] == 'R') &&
                        (pData[i + 9 + j] == 'd' || pData[i + 9 + j] == 'D'))
                     {
-                        nameIsKeyboard = TRUE;
+                        flags |= SCAN_FLAG_KEYBOARD_NAME;
                     }
                 }
                 break;
@@ -692,7 +713,56 @@ static uint8_t centralIsBleKeyboard(uint8_t* pData, uint8_t dataLen)
         i += len + 1;
     }
 
-    return (isKeyboardAppear || (hasHidSvc && nameIsKeyboard)) ? TRUE : FALSE;
+    return flags;
+}
+
+static uint8_t centralCheckAndCacheKeyboard(uint8_t* pAddr, uint8_t addrType, uint8_t* pData, uint8_t dataLen)
+{
+    uint8_t newFlags = centralParseScanData(pData, dataLen);
+    uint8_t slot = SCAN_CACHE_MAX;
+
+    for(uint8_t i = 0; i < sScanCacheCount; i++)
+    {
+        if(sScanCache[i].addrType == addrType &&
+           tmos_memcmp(sScanCache[i].addr, pAddr, B_ADDR_LEN))
+        {
+            slot = i;
+            break;
+        }
+    }
+
+    if(slot == SCAN_CACHE_MAX)
+    {
+        if(sScanCacheCount < SCAN_CACHE_MAX)
+        {
+            slot = sScanCacheCount++;
+        }
+        else
+        {
+            slot = 0;
+        }
+        tmos_memcpy(sScanCache[slot].addr, pAddr, B_ADDR_LEN);
+        sScanCache[slot].addrType = addrType;
+        sScanCache[slot].flags = 0;
+    }
+
+    sScanCache[slot].flags |= newFlags;
+
+    uint8_t totalFlags = sScanCache[slot].flags;
+    if((totalFlags & SCAN_FLAG_KEYBOARD_APP) ||
+       ((totalFlags & SCAN_FLAG_HID_SVC) && (totalFlags & SCAN_FLAG_KEYBOARD_NAME)))
+    {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static uint8_t centralIsBleKeyboard(uint8_t* pData, uint8_t dataLen)
+{
+    uint8_t flags = centralParseScanData(pData, dataLen);
+    return ((flags & SCAN_FLAG_KEYBOARD_APP) ||
+            ((flags & SCAN_FLAG_HID_SVC) && (flags & SCAN_FLAG_KEYBOARD_NAME))) ? TRUE : FALSE;
 }
 
 /*********************************************************************
@@ -785,7 +855,7 @@ static uint8_t centralIsBleMouse(uint8_t* pData, uint8_t dataLen)
  *
  * @brief   스캔된 디바이스가 SNV에 저장된 본딩 리스트에 있는지 확인.
  *          GAPBondMgr_ResolveAddr()는 RPA를 identity address로 변환하며,
- *          본딩되지 않은 주소는 실패를 반환한다.
+ *          성공 시 SUCCESS를 반환하고 본딩되지 않은 주소는 실패를 반환한다.
  *
  * @return  TRUE : 본딩된 디바이스 / FALSE : 아님
  */
@@ -877,12 +947,20 @@ static void centralProcessGATTMsg(gattMsgEvent_t* pMsg)
     {
         uint8_t len = pMsg->msg.handleValueNoti.len;
         uint8_t* p = pMsg->msg.handleValueNoti.pValue;
-#if 0
-        PRINT("[hdl=%04X] len=%d : ", pMsg->msg.handleValueNoti.handle, len);
-        for(uint8_t k = 0; k < len; k++) PRINT("%02X ", p[k]);
-        PRINT("\n");
-#endif
-        DevHIDKeyReport(p, len);
+
+        /* 선택된 키보드 특성 Handle 의 Notification 만 키보드 리포트로 처리 */
+        if(centralCharHdl != 0 && pMsg->msg.handleValueNoti.handle == centralCharHdl)
+        {
+            /* Report ID 가 선두에 포함되어 9바이트인 경우(Report ID + 8B 키보드 데이터) */
+            if(len == HID_KEYBOARD_REPORT_LEN + 1 && !centralIsBootKbd)
+            {
+                DevHIDKeyReport(p + 1, HID_KEYBOARD_REPORT_LEN);
+            }
+            else
+            {
+                DevHIDKeyReport(p, len);
+            }
+        }
     }
     /* Discovery 응답이면 별도 처리 함수로 위임 */
     else if(centralDiscState != BLE_DISC_STATE_IDLE)
@@ -964,6 +1042,7 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
         case GAP_DEVICE_INIT_DONE_EVENT:
         {
             PRINT("Discovering...\n");
+            centralResetScanCache();
             GAPRole_CentralStartDiscovery(DEFAULT_DISCOVERY_MODE,
                                           DEFAULT_DISCOVERY_ACTIVE_SCAN,
                                           DEFAULT_DISCOVERY_WHITE_LIST);
@@ -983,7 +1062,10 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
                 }
             }
 #if 1
-            if(centralIsBleKeyboard(pEvent->deviceInfo.pEvtData, pEvent->deviceInfo.dataLen))
+            if(centralCheckAndCacheKeyboard(pEvent->deviceInfo.addr,
+                                            pEvent->deviceInfo.addrType,
+                                            pEvent->deviceInfo.pEvtData,
+                                            pEvent->deviceInfo.dataLen))
 #else
             if(centralIsBleMouse(pEvent->deviceInfo.pEvtData, pEvent->deviceInfo.dataLen))
 #endif
@@ -998,6 +1080,7 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
         /* 스캔이 완료되었을 때 (한 번 스캔 사이클 종료) */
         case GAP_DEVICE_DISCOVERY_EVENT:
         {
+            centralResetScanCache();
             if(centralScanRes > 0)
             {
                 /* 리스트의 첫 번째 = 이번 스캔에서 필터를 통과한 마우스 */
@@ -1034,6 +1117,7 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
                 centralState = BLE_STATE_CONNECTED;
                 centralConnHandle = pEvent->linkCmpl.connectionHandle;
                 centralProcedureInProgress = TRUE;
+                centralBonded = FALSE; /* 새 연결 성립 시 페어링/암호화 완료 상태 초기화 */
 
                 /* 서비스 탐색을 일정 시간 후 시작 */
                 tmos_start_task(centralTaskId, START_SVC_DISCOVERY_EVT, DEFAULT_SVC_DISCOVERY_DELAY);
@@ -1064,6 +1148,7 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
                 PRINT("Connect Failed...Reason:%X\n", pEvent->gap.hdr.status);
                 PRINT("Discovering...\n");
                 centralScanRes = 0;
+                centralResetScanCache();
                 GAPRole_CentralStartDiscovery(DEFAULT_DISCOVERY_MODE,
                                               DEFAULT_DISCOVERY_ACTIVE_SCAN,
                                               DEFAULT_DISCOVERY_WHITE_LIST);
@@ -1080,6 +1165,8 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
             centralCharHdl = 0;
             
             centralReportFound = FALSE;
+            centralIsBootKbd = FALSE;
+            centralCharEndHdl = 0;
             centralCCCDHdl = 0;
             centralSvcStartHdl = 0;
             centralSvcEndHdl = 0;
@@ -1098,6 +1185,7 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
             tmos_start_task(centralTaskId, SEND_KEY_RELEASE_EVT, 80 /* 50ms */); // 연결 해제 후 50ms 뒤에 키 릴리즈 전송, 못 보냈을 때 대비.
 
             /* ★ 항상 재스캔 */
+            centralResetScanCache();
             GAPRole_CentralStartDiscovery(DEFAULT_DISCOVERY_MODE,
                                           DEFAULT_DISCOVERY_ACTIVE_SCAN,
                                           DEFAULT_DISCOVERY_WHITE_LIST);
@@ -1133,7 +1221,7 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
                     break;
             }
 
-            if(centralIsBleKeyboard(extAdv->pEvtData, extAdv->dataLen))
+            if(centralCheckAndCacheKeyboard(extAdv->addr, extAdv->addrType, extAdv->pEvtData, extAdv->dataLen))
             {
                 centralAddDeviceInfo(extAdv->addr, extAdv->addrType);
             }
@@ -1144,6 +1232,14 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
         case GAP_DIRECT_DEVICE_INFO_EVENT:
         {
             PRINT("Recv direct adv \n");
+            if(centralMode == CENTRAL_MODE_PAIRED_ONLY)
+            {
+                if(!centralIsBondedDevice(pEvent->deviceDirectInfo.addr,
+                                          pEvent->deviceDirectInfo.addrType))
+                {
+                    break;
+                }
+            }
             centralAddDeviceInfo(pEvent->deviceDirectInfo.addr, pEvent->deviceDirectInfo.addrType);
         }
         break;
@@ -1272,8 +1368,9 @@ static void centralStartDiscovery(void)
 
     centralSvcStartHdl = centralSvcEndHdl = centralCharHdl = 0;
     centralCCCDHdl = 0;
-    centralReportFound = FALSE;    // ★ 추가
-    centralBonded = FALSE;         // ★ 추가 (페어링 상태 재판정)
+    centralReportFound = FALSE;
+    centralIsBootKbd = FALSE;
+    centralCharEndHdl = 0;
 
     centralDiscState = BLE_DISC_STATE_SVC;
 
@@ -1303,12 +1400,14 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
         if(pMsg->method == ATT_FIND_BY_TYPE_VALUE_RSP &&
            pMsg->msg.findByTypeValueRsp.numInfo > 0)
         {
-            /* start handle 만 신뢰. end handle 은 신뢰 불가 → 0xFFFF 로 두고
-             * 어차피 HID 는 마지막 서비스라 문제 없음 */
             centralSvcStartHdl = ATT_ATTR_HANDLE(pMsg->msg.findByTypeValueRsp.pHandlesInfo, 0);
-            centralSvcEndHdl = 0xFFFF;
+            centralSvcEndHdl = ATT_GRP_END_HANDLE(pMsg->msg.findByTypeValueRsp.pHandlesInfo, 0);
+            if(centralSvcEndHdl == 0)
+            {
+                centralSvcEndHdl = 0xFFFF;
+            }
 
-            PRINT("HID Service start : %x\n", centralSvcStartHdl);
+            PRINT("HID Service start : %x, end : %x\n", centralSvcStartHdl, centralSvcEndHdl);
         }
 
         if((pMsg->method == ATT_FIND_BY_TYPE_VALUE_RSP &&
@@ -1333,7 +1432,7 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
             }
         }
     }
-    /* ---------- 2단계 : Characteristic 파싱 → Report(0x2A4D) 찾기 ---------- */
+    /* ---------- 2단계 : Characteristic 파싱 → 키보드 Report 찾기 ---------- */
     else if(centralDiscState == BLE_DISC_STATE_CHAR)
     {
         if(pMsg->method == ATT_READ_BY_TYPE_RSP &&
@@ -1354,15 +1453,25 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
                 PRINT("  Char: decl=%x props=%02X val=%x uuid=%04X\n",
                       charHdl, props, valueHdl, uuid);
 
-                /* ★ 첫 번째 Notify 지원 Report 만 선택, 이후 Report 는 무시 */
+                /* ★ 첫 번째 Notify 지원 Report(0x2A4D) 를 우선 선택.
+                 *    (Report 가 없는 기기일 때만 Boot Keyboard Report(0x2A22) fallback)
+                 *    한 번 선택된 후에는 다른 Report 로 덮어쓰지 않는다. */
                 if(!centralReportFound &&
-                   uuid == HID_REPORT_CHAR_UUID &&
+                   (uuid == HID_REPORT_CHAR_UUID || uuid == BOOT_KEY_INPUT_UUID) &&
                    (props & 0x10))               /* Notify bit */
                 {
                     centralCharHdl = valueHdl;
                     centralReportFound = TRUE;
-                    PRINT("  → Selected Report val handle = %x (props=%02X)\n",
+                    centralIsBootKbd = (uuid == BOOT_KEY_INPUT_UUID) ? TRUE : FALSE;
+                    centralCharEndHdl = 0;
+                    PRINT("  → Selected %s val handle = %x (props=%02X)\n",
+                          (uuid == BOOT_KEY_INPUT_UUID) ? "Boot Keyboard" : "Report",
                           valueHdl, props);
+                }
+                else if(centralReportFound && centralCharEndHdl == 0 && charHdl > centralCharHdl)
+                {
+                    /* 선택된 특성 이후에 나타난 다음 특성 선언의 직전 핸들을 경계로 설정 */
+                    centralCharEndHdl = charHdl - 1;
                 }
             }
         }
@@ -1378,16 +1487,20 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
             }
             else
             {
-                /* ★ CCCD 는 Report value handle 바로 뒤 2~3 개 handle 안에 있음.
-                 *   (Report Reference 0x2908 + CCCD 0x2902) */
+                if(centralCharEndHdl == 0 || centralCharEndHdl < centralCharHdl)
+                {
+                    centralCharEndHdl = centralSvcEndHdl;
+                }
+
                 centralDiscState = BLE_DISC_STATE_CCCD;
 
                 req.startHandle = centralCharHdl + 1;
-                req.endHandle = centralCharHdl + 3;
+                req.endHandle = (centralCharEndHdl >= req.startHandle) ? centralCharEndHdl : req.startHandle;
                 req.type.len = ATT_BT_UUID_SIZE;
                 req.type.uuid[0] = LO_UINT16(GATT_CLIENT_CHAR_CFG_UUID);
                 req.type.uuid[1] = HI_UINT16(GATT_CLIENT_CHAR_CFG_UUID);
 
+                PRINT("Discover CCCD range [%x, %x]\n", req.startHandle, req.endHandle);
                 GATT_ReadUsingCharUUID(centralConnHandle, &req, centralTaskId);
             }
         }

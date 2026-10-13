@@ -46,6 +46,24 @@ uint8_t        USB_SleepStatus = 0x00; // USB sleep 상태
 
 /* 마우스/키보드 데이터 */
 uint8_t HIDKey[8] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+
+#define KEY_REPORT_QUEUE_SIZE 16
+typedef struct {
+    uint8_t report[HID_KEYBOARD_REPORT_LEN];
+} key_report_t;
+
+static key_report_t sKeyReportQueue[KEY_REPORT_QUEUE_SIZE];
+static volatile uint8_t sKeyQueueHead = 0;
+static volatile uint8_t sKeyQueueTail = 0;
+static volatile uint8_t sKeyEP1Busy = 0;
+
+static void DevHIDKeyQueueReset(void)
+{
+    sKeyQueueHead = 0;
+    sKeyQueueTail = 0;
+    sKeyEP1Busy = 0;
+}
+
 /******** 사용자 정의 Endpoint RAM 할당 ****************************************/
 __attribute__((aligned(4))) uint8_t EP0_Databuf[64 + 64 + 64]; //ep0(64)+ep4_out(64)+ep4_in(64)
 __attribute__((aligned(4))) uint8_t EP1_Databuf[64 + 64];      //ep1_out(64)+ep1_in(64)
@@ -118,6 +136,17 @@ void USB_DevTransProcess(void)
                 {
                     R8_UEP1_CTRL ^= RB_UEP_T_TOG;
                     R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
+
+                    if(sKeyQueueHead != sKeyQueueTail)
+                    {
+                        memcpy(pEP1_IN_DataBuf, sKeyReportQueue[sKeyQueueTail].report, HID_KEYBOARD_REPORT_LEN);
+                        sKeyQueueTail = (sKeyQueueTail + 1) % KEY_REPORT_QUEUE_SIZE;
+                        DevEP1_IN_Deal(HID_KEYBOARD_REPORT_LEN);
+                    }
+                    else
+                    {
+                        sKeyEP1Busy = 0;
+                    }
                     break;
                 }
 #if 0
@@ -241,7 +270,9 @@ void USB_DevTransProcess(void)
                                 }
 #endif
                                 else
-                                    len = 0xff; // 이 프로그램은 2개 interface만 있으므로 정상적으로는 실행되지 않음
+                                {
+                                    bError = 0xff; // 지원하지 않는 인터페이스는 STALL 처리
+                                }
                                 break;
                             }
 
@@ -283,10 +314,13 @@ void USB_DevTransProcess(void)
                             bError = 0xff;
                             break;
                         }
-                        if(SetupReqLen > len) SetupReqLen = len; // 실제 업로드 총 길이
-                        len = (SetupReqLen >= DevEP0SIZE) ? DevEP0SIZE : SetupReqLen;
-                        memcpy(pEP0_DataBuf, pDescr, len);
-                        pDescr += len;
+                        if(bError != 0xff)
+                        {
+                            if(SetupReqLen > len) SetupReqLen = len; // 실제 업로드 총 길이
+                            len = (SetupReqLen >= DevEP0SIZE) ? DevEP0SIZE : SetupReqLen;
+                            memcpy(pEP0_DataBuf, pDescr, len);
+                            pDescr += len;
+                        }
                         break;
                     }
 
@@ -502,6 +536,7 @@ void USB_DevTransProcess(void)
         R8_UEP1_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
 //        R8_UEP2_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
 //        R8_UEP3_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
+        DevHIDKeyQueueReset();
         R8_USB_INT_FG = RB_UIF_BUS_RST;
     }
     else if(bmIntFlag & RB_UIF_SUSPEND)
@@ -541,19 +576,56 @@ void DevHIDMouseReport(uint8_t mouse)
 /*********************************************************************
  * @fn      DevHIDKeyReport
  *
- * @brief   키보드 데이터 보고
+ * @brief   키보드 데이터 보고 (전송 큐를 통해 호스트 수신 전 덮어쓰기 방지)
  *
  * @return  none
  */
 void DevHIDKeyReport(uint8_t* aKey, uint8_t nLen)
 {
-    if(nLen >= HID_KEYBOARD_REPORT_LEN) nLen = HID_KEYBOARD_REPORT_LEN;
+    uint8_t tempReport[HID_KEYBOARD_REPORT_LEN];
+    uint8_t nextHead;
+
+#if 1
+    PRINT("[hdl=%04X] len=%d : ", aKey, nLen);
+    for(uint8_t k = 0; k < nLen; k++) PRINT("%02X ", aKey[k]);
+    PRINT("\n");
+#endif
+
+
+    memset(tempReport, 0, HID_KEYBOARD_REPORT_LEN);
+    if(aKey != NULL && nLen > 0)
+    {
+        if(nLen > HID_KEYBOARD_REPORT_LEN) nLen = HID_KEYBOARD_REPORT_LEN;
+        memcpy(tempReport, aKey, nLen);
+    }
+
+    PFIC_DisableIRQ(USB_IRQn);
+
+    if(!sKeyEP1Busy)
+    {
+        /* 전송 중이 아니면 즉시 DMA 버퍼로 복사 후 전송 */
+        memcpy(pEP1_IN_DataBuf, tempReport, HID_KEYBOARD_REPORT_LEN);
+        sKeyEP1Busy = 1;
+        DevEP1_IN_Deal(HID_KEYBOARD_REPORT_LEN);
+    }
     else
     {
-        memset(pEP1_IN_DataBuf, 0, HID_KEYBOARD_REPORT_LEN);
+        /* 이미 전송 중이면 큐에 적재하여 다음 완료 인터럽트에서 전송 */
+        nextHead = (sKeyQueueHead + 1) % KEY_REPORT_QUEUE_SIZE;
+        if(nextHead != sKeyQueueTail)
+        {
+            memcpy(sKeyReportQueue[sKeyQueueHead].report, tempReport, HID_KEYBOARD_REPORT_LEN);
+            sKeyQueueHead = nextHead;
+        }
+        else
+        {
+            /* 큐 오버플로우 시 최신 상태 보존을 위해 마지막 슬롯 갱신 */
+            uint8_t lastIdx = (sKeyQueueHead + KEY_REPORT_QUEUE_SIZE - 1) % KEY_REPORT_QUEUE_SIZE;
+            memcpy(sKeyReportQueue[lastIdx].report, tempReport, HID_KEYBOARD_REPORT_LEN);
+        }
     }
-    memcpy(pEP1_IN_DataBuf, aKey, nLen);
-    DevEP1_IN_Deal(HID_KEYBOARD_REPORT_LEN);
+
+    PFIC_EnableIRQ(USB_IRQn);
 }
 
 /*********************************************************************
@@ -572,6 +644,7 @@ void USB_IRQHandler(void) /* USB interrupt service routine, register bank 1 사�
 
 void AppUSB_Init(void)
 {
+    DevHIDKeyQueueReset();
     pEP0_RAM_Addr = EP0_Databuf;
     pEP1_RAM_Addr = EP1_Databuf;
 //    pEP2_RAM_Addr = EP2_Databuf;

@@ -69,9 +69,17 @@ extern "C" {
 #define HID_SERVICE_UUID        0x1812
 #define HID_REPORT_CHAR_UUID    0x2A4D
 #define HID_PROTOCOL_MODE_UUID  0x2A4E
+#define BOOT_KEY_INPUT_UUID     0x2A22   /* Boot Keyboard Input Report */
 
 /* Report Reference Descriptor (0x2908): Input(1)/Output(2)/Feature(3) */
 #define HID_REPORT_REF_UUID     0x2908
+
+#ifndef GAP_BONDINGS_MAX
+#define GAP_BONDINGS_MAX        6
+#endif
+
+/* GAPBondMgr_ResolveAddr: RPA 해석 및 본딩 여부 검사 (성공 시 SUCCESS 반환) */
+extern uint8_t GAPBondMgr_ResolveAddr(uint8_t addrType, uint8_t *pDevAddr, uint8_t *pResolvedAddr);
 
 /*********************************************************************
  * MACROS
