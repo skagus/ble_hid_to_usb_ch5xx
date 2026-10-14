@@ -350,6 +350,17 @@ void USB_DevTransProcess(void)
 #endif
                                 case 0x81:
                                 R8_UEP1_CTRL = (R8_UEP1_CTRL & ~(RB_UEP_T_TOG | MASK_UEP_T_RES)) | UEP_T_RES_NAK;
+                                if(sKeyQueueHead != sKeyQueueTail)
+                                {
+                                    memcpy(pEP1_IN_DataBuf, sKeyReportQueue[sKeyQueueTail].report, HID_KEYBOARD_REPORT_LEN);
+                                    sKeyQueueTail = (sKeyQueueTail + 1) % KEY_REPORT_QUEUE_SIZE;
+                                    sKeyEP1Busy = 1;
+                                    DevEP1_IN_Deal(HID_KEYBOARD_REPORT_LEN);
+                                }
+                                else
+                                {
+                                    sKeyEP1Busy = 0;
+                                }
                                 break;
 #if 0                                    
                                 case 0x02:

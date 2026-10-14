@@ -69,6 +69,7 @@ extern "C" {
 #define HID_SERVICE_UUID        0x1812
 #define HID_REPORT_CHAR_UUID    0x2A4D
 #define HID_PROTOCOL_MODE_UUID  0x2A4E
+#define HID_REPORT_MAP_UUID     0x2A4B
 #define BOOT_KEY_INPUT_UUID     0x2A22   /* Boot Keyboard Input Report */
 
 /* Report Reference Descriptor (0x2908): Input(1)/Output(2)/Feature(3) */

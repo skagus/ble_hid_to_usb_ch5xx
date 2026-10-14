@@ -142,16 +142,20 @@ enum
 /*
  * GATT 탐색(Discovery) 상태
  * IDLE : 탐색 안 함
- * SVC  : Primary Service 탐색 중
- * CHAR : Characteristic 탐색 중
- * CCCD : Client Characteristic Configuration Descriptor 탐색 중
+ * SVC        : Primary Service 탐색 중
+ * CHAR       : Characteristic 탐색 중
+ * REPORT_MAP : Report Map 탐색/읽기 중
+ * REPORT_REF : Report Reference Descriptor 탐색 중
+ * CCCD       : Client Characteristic Configuration Descriptor 탐색 중
  */
 enum
 {
-    BLE_DISC_STATE_IDLE, // Idle
-    BLE_DISC_STATE_SVC,  // Service discovery
-    BLE_DISC_STATE_CHAR, // Characteristic discovery
-    BLE_DISC_STATE_CCCD  // client characteristic configuration discovery
+    BLE_DISC_STATE_IDLE,       // Idle
+    BLE_DISC_STATE_SVC,        // Service discovery
+    BLE_DISC_STATE_CHAR,       // Characteristic discovery
+    BLE_DISC_STATE_REPORT_MAP, // Report Map discovery/read
+    BLE_DISC_STATE_REPORT_REF, // Report Reference discovery
+    BLE_DISC_STATE_CCCD        // CCCD discovery
 };
 /*********************************************************************
  * TYPEDEFS
@@ -232,6 +236,53 @@ static uint8_t centralProcedureInProgress = FALSE;
 static uint8_t centralReportFound = FALSE;
 static uint8_t centralIsBootKbd = FALSE;
 static uint16_t centralCharEndHdl = 0;
+
+#define MAX_DISC_REPORTS 8
+
+typedef struct {
+    uint16_t declHandle;
+    uint16_t valueHandle;
+    uint16_t endHandle;
+    uint8_t  props;
+    uint8_t  reportId;     // Report Reference에서 읽은 값 (기본 0xFF)
+    uint8_t  reportType;   // 1=Input, 2=Output, 3=Feature (기본 0)
+    uint16_t cccdHandle;   // CCCD handle
+} disc_report_t;
+
+static disc_report_t sDiscReports[MAX_DISC_REPORTS];
+static uint8_t sDiscReportCount = 0;
+
+static uint16_t sDiscBootKeyValHdl = 0;
+static uint16_t sDiscBootKeyEndHdl = 0;
+static uint8_t  sDiscBootKeyProps = 0;
+static uint16_t sDiscBootKeyCCCDHdl = 0;
+
+static uint16_t sDiscProtocolModeHdl = 0;
+static uint16_t sDiscReportMapHdl = 0;
+
+static uint8_t sKbdReportId = 0xFF;
+static uint8_t sConsumerReportId = 0xFF;
+
+static void centralResetDiscoveryVars(void)
+{
+    sDiscReportCount = 0;
+    tmos_memset(sDiscReports, 0, sizeof(sDiscReports));
+    for(uint8_t i = 0; i < MAX_DISC_REPORTS; i++)
+    {
+        sDiscReports[i].reportId = 0xFF;
+    }
+    sDiscBootKeyValHdl = 0;
+    sDiscBootKeyEndHdl = 0;
+    sDiscBootKeyProps = 0;
+    sDiscBootKeyCCCDHdl = 0;
+    sDiscProtocolModeHdl = 0;
+    sDiscReportMapHdl = 0;
+    sKbdReportId = 0xFF;
+    sConsumerReportId = 0xFF;
+    centralReportFound = FALSE;
+    centralIsBootKbd = FALSE;
+    centralCharEndHdl = 0;
+}
 
 /* 페어링(암호화) 완료 여부 */
 static uint8_t centralBonded = FALSE;
@@ -497,6 +548,16 @@ uint16_t Central_ProcessEvent(uint8_t task_id, uint16_t events)
     /* CCCD 쓰기 이벤트 : 슬레이브의 Notify 를 켜기 위해 CCCD 에 1을 기록 */
     if(events & START_WRITE_CCCD_EVT)
     {
+        /* 연결이 종료되었거나 유효하지 않은 핸들인 경우 재시도 없이 이벤트 소비 */
+        if(centralState != BLE_STATE_CONNECTED ||
+           centralConnHandle == GAP_CONNHANDLE_INIT ||
+           centralCCCDHdl == 0)
+        {
+            return (events ^ START_WRITE_CCCD_EVT);
+        }
+
+        uint8_t writeSuccess = FALSE;
+
         if(centralProcedureInProgress == FALSE)
         {
             attWriteReq_t req;
@@ -512,16 +573,34 @@ uint16_t Central_ProcessEvent(uint8_t task_id, uint16_t events)
                 req.pValue[0] = 1;
                 req.pValue[1] = 0;
 
-                if(GATT_WriteCharValue(centralConnHandle, &req, centralTaskId) == SUCCESS)
+                bStatus_t status = GATT_WriteCharValue(centralConnHandle, &req, centralTaskId);
+                if(status == SUCCESS)
                 {
                     centralProcedureInProgress = TRUE;
+                    writeSuccess = TRUE;
                 }
                 else
                 {
                     GATT_bm_free((gattMsg_t*)&req, ATT_WRITE_REQ);
+                    PRINT("CCCD write fail status=0x%02X\n", status);
                 }
             }
+            else
+            {
+                PRINT("CCCD GATT_bm_alloc fail\n");
+            }
         }
+        else
+        {
+            PRINT("CCCD defer: procedure in progress\n");
+        }
+
+        if(!writeSuccess)
+        {
+            /* 일시적 실패 (절차 진행 중, 메모리 부족, 전송 실패 등) 시 100ms 후 재시도 예약 */
+            tmos_start_task(centralTaskId, START_WRITE_CCCD_EVT, 160 /* 100ms */);
+        }
+
         return (events ^ START_WRITE_CCCD_EVT);
     }
 
@@ -731,22 +810,45 @@ static uint8_t centralCheckAndCacheKeyboard(uint8_t* pAddr, uint8_t addrType, ui
         }
     }
 
-    if(slot == SCAN_CACHE_MAX)
+    if(slot != SCAN_CACHE_MAX)
     {
+        /* 캐시 Hit: 플래그 누적 및 LRU 갱신(가장 최근 위치인 맨 뒤로 이동) */
+        sScanCache[slot].flags |= newFlags;
+        scan_adv_cache_t hitEntry = sScanCache[slot];
+
+        for(uint8_t j = slot; j + 1 < sScanCacheCount; j++)
+        {
+            sScanCache[j] = sScanCache[j + 1];
+        }
+        sScanCache[sScanCacheCount - 1] = hitEntry;
+        slot = sScanCacheCount - 1;
+    }
+    else
+    {
+        /* 신규 장치: 관련 정보(newFlags)가 전혀 없는 광고는 슬롯을 차지하지 않음 */
+        if(newFlags == 0)
+        {
+            return FALSE;
+        }
+
         if(sScanCacheCount < SCAN_CACHE_MAX)
         {
             slot = sScanCacheCount++;
         }
         else
         {
-            slot = 0;
+            /* 캐시가 가득 찬 경우 가장 오래된 항목(index 0)을 밀어내고 맨 뒤에 등록 (LRU) */
+            for(uint8_t j = 0; j + 1 < SCAN_CACHE_MAX; j++)
+            {
+                sScanCache[j] = sScanCache[j + 1];
+            }
+            slot = SCAN_CACHE_MAX - 1;
         }
+
         tmos_memcpy(sScanCache[slot].addr, pAddr, B_ADDR_LEN);
         sScanCache[slot].addrType = addrType;
-        sScanCache[slot].flags = 0;
+        sScanCache[slot].flags = newFlags;
     }
-
-    sScanCache[slot].flags |= newFlags;
 
     uint8_t totalFlags = sScanCache[slot].flags;
     if((totalFlags & SCAN_FLAG_KEYBOARD_APP) ||
@@ -935,6 +1037,11 @@ static void centralProcessGATTMsg(gattMsgEvent_t* pMsg)
         {
             uint8_t status = pMsg->msg.errorRsp.errCode;
             PRINT("Write Error: %x\n", status);
+            /* 연결 상태에서 쓰기 실패 시 CCCD 재시도 예약 */
+            if(centralState == BLE_STATE_CONNECTED && centralCCCDHdl != 0)
+            {
+                tmos_start_task(centralTaskId, START_WRITE_CCCD_EVT, 160 /* 100ms */);
+            }
         }
         else
         {
@@ -951,14 +1058,40 @@ static void centralProcessGATTMsg(gattMsgEvent_t* pMsg)
         /* 선택된 키보드 특성 Handle 의 Notification 만 키보드 리포트로 처리 */
         if(centralCharHdl != 0 && pMsg->msg.handleValueNoti.handle == centralCharHdl)
         {
-            /* Report ID 가 선두에 포함되어 9바이트인 경우(Report ID + 8B 키보드 데이터) */
-            if(len == HID_KEYBOARD_REPORT_LEN + 1 && !centralIsBootKbd)
+            if(centralIsBootKbd)
             {
-                DevHIDKeyReport(p + 1, HID_KEYBOARD_REPORT_LEN);
+                /* Boot Keyboard는 표준 8바이트 (Modifier, Reserved, Key1..Key6) */
+                DevHIDKeyReport(p, len);
             }
             else
             {
-                DevHIDKeyReport(p, len);
+                /* 일반 Report: Report Reference 및 Report Map 에 따른 판별과 변환 */
+                if(len == HID_KEYBOARD_REPORT_LEN + 1)
+                {
+                    /* Report ID 가 선두에 포함된 9바이트인 경우 (Report ID + 8B 키보드 데이터) */
+                    if(sKbdReportId == 0xFF || p[0] == sKbdReportId)
+                    {
+                        DevHIDKeyReport(p + 1, HID_KEYBOARD_REPORT_LEN);
+                    }
+                    else
+                    {
+                        PRINT("Ignore non-kbd report (ID=%d)\n", p[0]);
+                    }
+                }
+                else if(len == HID_KEYBOARD_REPORT_LEN)
+                {
+                    /* Report ID 없이 순수 8바이트 키보드 리포트 */
+                    DevHIDKeyReport(p, HID_KEYBOARD_REPORT_LEN);
+                }
+                else if(len > HID_KEYBOARD_REPORT_LEN && sKbdReportId != 0xFF && p[0] == sKbdReportId)
+                {
+                    DevHIDKeyReport(p + 1, HID_KEYBOARD_REPORT_LEN);
+                }
+                else
+                {
+                    /* 길이가 8바이트 미만(예: Consumer Control 리포트 등)인 경우 오인식 방지 차단 */
+                    PRINT("Ignore non-keyboard notification (len=%d)\n", len);
+                }
             }
         }
     }
@@ -1118,6 +1251,11 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
                 centralConnHandle = pEvent->linkCmpl.connectionHandle;
                 centralProcedureInProgress = TRUE;
                 centralBonded = FALSE; /* 새 연결 성립 시 페어링/암호화 완료 상태 초기화 */
+
+                /* 새 연결 직후, 이전 연결에서 눌린 채 남은 키가 USB에 남아있을 수 있으므로
+                 * all-zero release 리포트를 전송한다.
+                 * (연결 종료 시점에 보낸 release가 USB 전송 중 실패한 경우 대비) */
+                centralSendKeyRelease();
 
                 /* 서비스 탐색을 일정 시간 후 시작 */
                 tmos_start_task(centralTaskId, START_SVC_DISCOVERY_EVT, DEFAULT_SVC_DISCOVERY_DELAY);
