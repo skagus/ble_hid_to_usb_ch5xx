@@ -247,10 +247,12 @@ typedef struct {
     uint8_t  reportId;     // Report Reference에서 읽은 값 (기본 0xFF)
     uint8_t  reportType;   // 1=Input, 2=Output, 3=Feature (기본 0)
     uint16_t cccdHandle;   // CCCD handle
+    uint8_t  cccdEnabled;  // CCCD 활성화 완료 여부
 } disc_report_t;
 
 static disc_report_t sDiscReports[MAX_DISC_REPORTS];
 static uint8_t sDiscReportCount = 0;
+static uint8_t sDiscReportIdx = 0;
 
 static uint16_t sDiscBootKeyValHdl = 0;
 static uint16_t sDiscBootKeyEndHdl = 0;
@@ -266,6 +268,7 @@ static uint8_t sConsumerReportId = 0xFF;
 static void centralResetDiscoveryVars(void)
 {
     sDiscReportCount = 0;
+    sDiscReportIdx = 0;
     tmos_memset(sDiscReports, 0, sizeof(sDiscReports));
     for(uint8_t i = 0; i < MAX_DISC_REPORTS; i++)
     {
@@ -282,6 +285,7 @@ static void centralResetDiscoveryVars(void)
     centralReportFound = FALSE;
     centralIsBootKbd = FALSE;
     centralCharEndHdl = 0;
+    centralCCCDHdl = 0;
 }
 
 /* 페어링(암호화) 완료 여부 */
@@ -548,11 +552,36 @@ uint16_t Central_ProcessEvent(uint8_t task_id, uint16_t events)
     /* CCCD 쓰기 이벤트 : 슬레이브의 Notify 를 켜기 위해 CCCD 에 1을 기록 */
     if(events & START_WRITE_CCCD_EVT)
     {
-        /* 연결이 종료되었거나 유효하지 않은 핸들인 경우 재시도 없이 이벤트 소비 */
+        /* 연결이 종료되었거나 유효하지 않은 연결인 경우 재시도 없이 이벤트 소비 */
         if(centralState != BLE_STATE_CONNECTED ||
-           centralConnHandle == GAP_CONNHANDLE_INIT ||
-           centralCCCDHdl == 0)
+           centralConnHandle == GAP_CONNHANDLE_INIT)
         {
+            return (events ^ START_WRITE_CCCD_EVT);
+        }
+
+        /* 1) sDiscReports 중 아직 활성화되지 않은 CCCD 찾기 */
+        uint16_t targetCCCD = 0;
+        int8_t targetIdx = -1;
+
+        for(uint8_t i = 0; i < sDiscReportCount; i++)
+        {
+            if(sDiscReports[i].cccdHandle != 0 && !sDiscReports[i].cccdEnabled)
+            {
+                targetCCCD = sDiscReports[i].cccdHandle;
+                targetIdx = (int8_t)i;
+                break;
+            }
+        }
+
+        /* fallback: sDiscReports에 없지만 legacy centralCCCDHdl이 남아있는 경우 */
+        if(targetCCCD == 0 && centralCCCDHdl != 0 && sDiscReportCount == 0)
+        {
+            targetCCCD = centralCCCDHdl;
+        }
+
+        if(targetCCCD == 0)
+        {
+            /* 모든 CCCD 쓰기 완료 */
             return (events ^ START_WRITE_CCCD_EVT);
         }
 
@@ -564,7 +593,7 @@ uint16_t Central_ProcessEvent(uint8_t task_id, uint16_t events)
 
             req.cmd = FALSE;
             req.sig = FALSE;
-            req.handle = centralCCCDHdl;
+            req.handle = targetCCCD;
             req.len = 2;
             req.pValue = GATT_bm_alloc(centralConnHandle, ATT_WRITE_REQ, req.len, NULL, 0);
             if(req.pValue != NULL)
@@ -578,6 +607,11 @@ uint16_t Central_ProcessEvent(uint8_t task_id, uint16_t events)
                 {
                     centralProcedureInProgress = TRUE;
                     writeSuccess = TRUE;
+                    if(targetIdx >= 0)
+                    {
+                        sDiscReports[targetIdx].cccdEnabled = TRUE;
+                    }
+                    PRINT("CCCD write sent: hdl=%x (idx=%d)\n", targetCCCD, targetIdx);
                 }
                 else
                 {
@@ -1038,7 +1072,7 @@ static void centralProcessGATTMsg(gattMsgEvent_t* pMsg)
             uint8_t status = pMsg->msg.errorRsp.errCode;
             PRINT("Write Error: %x\n", status);
             /* 연결 상태에서 쓰기 실패 시 CCCD 재시도 예약 */
-            if(centralState == BLE_STATE_CONNECTED && centralCCCDHdl != 0)
+            if(centralState == BLE_STATE_CONNECTED)
             {
                 tmos_start_task(centralTaskId, START_WRITE_CCCD_EVT, 160 /* 100ms */);
             }
@@ -1046,6 +1080,11 @@ static void centralProcessGATTMsg(gattMsgEvent_t* pMsg)
         else
         {
             PRINT("Write success \n");
+            /* 다음 미완료 CCCD가 있는 경우 즉시 연속 활성화 진행 */
+            if(centralState == BLE_STATE_CONNECTED)
+            {
+                tmos_start_task(centralTaskId, START_WRITE_CCCD_EVT, 16 /* 10ms */);
+            }
         }
         centralProcedureInProgress = FALSE;
     }
@@ -1054,43 +1093,82 @@ static void centralProcessGATTMsg(gattMsgEvent_t* pMsg)
     {
         uint8_t len = pMsg->msg.handleValueNoti.len;
         uint8_t* p = pMsg->msg.handleValueNoti.pValue;
+        uint16_t hdl = pMsg->msg.handleValueNoti.handle;
 
-        /* 선택된 키보드 특성 Handle 의 Notification 만 키보드 리포트로 처리 */
-        if(centralCharHdl != 0 && pMsg->msg.handleValueNoti.handle == centralCharHdl)
+        /* 수신된 Handle에 매칭되는 Report 검색 */
+        disc_report_t* pRep = NULL;
+        for(uint8_t i = 0; i < sDiscReportCount; i++)
         {
-            if(centralIsBootKbd)
+            if(sDiscReports[i].valueHandle == hdl)
+            {
+                pRep = &sDiscReports[i];
+                break;
+            }
+        }
+
+        /* 등록된 Report 핸들이거나 레거시 centralCharHdl인 경우 처리 */
+        if(pRep != NULL || (centralCharHdl != 0 && hdl == centralCharHdl))
+        {
+            if(centralIsBootKbd && hdl == centralCharHdl)
             {
                 /* Boot Keyboard는 표준 8바이트 (Modifier, Reserved, Key1..Key6) */
                 DevHIDKeyReport(p, len);
             }
             else
             {
-                /* 일반 Report: Report Reference 및 Report Map 에 따른 판별과 변환 */
-                if(len == HID_KEYBOARD_REPORT_LEN + 1)
+                /* 1. 표준 키보드 8바이트 */
+                if(len == HID_KEYBOARD_REPORT_LEN)
                 {
-                    /* Report ID 가 선두에 포함된 9바이트인 경우 (Report ID + 8B 키보드 데이터) */
-                    if(sKbdReportId == 0xFF || p[0] == sKbdReportId)
+                    if(pRep && pRep->reportId != 0xFF)
                     {
-                        DevHIDKeyReport(p + 1, HID_KEYBOARD_REPORT_LEN);
+                        sKbdReportId = pRep->reportId;
                     }
-                    else
-                    {
-                        PRINT("Ignore non-kbd report (ID=%d)\n", p[0]);
-                    }
-                }
-                else if(len == HID_KEYBOARD_REPORT_LEN)
-                {
-                    /* Report ID 없이 순수 8바이트 키보드 리포트 */
                     DevHIDKeyReport(p, HID_KEYBOARD_REPORT_LEN);
                 }
+                /* 2. Report ID가 포함된 키보드 9바이트 (Report ID + 8바이트 데이터) */
+                else if(len == HID_KEYBOARD_REPORT_LEN + 1 &&
+                        (sKbdReportId == 0xFF || p[0] == sKbdReportId || (pRep && pRep->reportId == p[0])))
+                {
+                    sKbdReportId = p[0];
+                    DevHIDKeyReport(p + 1, HID_KEYBOARD_REPORT_LEN);
+                }
+                /* 3. 순수 Consumer Control 2바이트 */
+                else if(len == HID_CONSUMER_REPORT_LEN)
+                {
+                    if(pRep && pRep->reportId != 0xFF)
+                    {
+                        sConsumerReportId = pRep->reportId;
+                    }
+                    DevHIDConsumerReport(p, HID_CONSUMER_REPORT_LEN);
+                }
+                /* 4. Report ID가 포함된 Consumer Control 3바이트 (Report ID + 2바이트 데이터) */
+                else if(len == HID_CONSUMER_REPORT_LEN + 1 &&
+                        (sConsumerReportId == 0xFF || p[0] == sConsumerReportId || (pRep && pRep->reportId == p[0])))
+                {
+                    sConsumerReportId = p[0];
+                    DevHIDConsumerReport(p + 1, HID_CONSUMER_REPORT_LEN);
+                }
+                /* 5. 1바이트 Consumer Control 코드 */
+                else if(len == 1 &&
+                        (sConsumerReportId != 0xFF && pRep && pRep->reportId == sConsumerReportId))
+                {
+                    uint8_t consData[HID_CONSUMER_REPORT_LEN] = {p[0], 0};
+                    DevHIDConsumerReport(consData, HID_CONSUMER_REPORT_LEN);
+                }
+                /* 6. 키보드 리포트 길이가 8바이트 초과이면서 Report ID 매칭인 경우 */
                 else if(len > HID_KEYBOARD_REPORT_LEN && sKbdReportId != 0xFF && p[0] == sKbdReportId)
                 {
                     DevHIDKeyReport(p + 1, HID_KEYBOARD_REPORT_LEN);
                 }
+                /* 7. Consumer Report ID 매칭이면서 길이가 3바이트 이상인 경우 */
+                else if(sConsumerReportId != 0xFF && p[0] == sConsumerReportId && len >= 3)
+                {
+                    DevHIDConsumerReport(p + 1, HID_CONSUMER_REPORT_LEN);
+                }
                 else
                 {
-                    /* 길이가 8바이트 미만(예: Consumer Control 리포트 등)인 경우 오인식 방지 차단 */
-                    PRINT("Ignore non-keyboard notification (len=%d)\n", len);
+                    PRINT("Ignore unhandled notification (hdl=%x, len=%d, ID=%d)\n",
+                          hdl, len, (len > 0) ? p[0] : 0);
                 }
             }
         }
@@ -1151,9 +1229,11 @@ static void centralHciMTUChangeCB(uint16_t connHandle, uint16_t maxTxOctets, uin
  */
 static void centralSendKeyRelease(void)
 {
-    uint8_t allZero[HID_KEYBOARD_REPORT_LEN] = {0};
+    uint8_t allZeroKbd[HID_KEYBOARD_REPORT_LEN] = {0};
+    uint8_t allZeroConsumer[HID_CONSUMER_REPORT_LEN] = {0};
 
-    DevHIDKeyReport(allZero, HID_KEYBOARD_REPORT_LEN);
+    DevHIDKeyReport(allZeroKbd, HID_KEYBOARD_REPORT_LEN);
+    DevHIDConsumerReport(allZeroConsumer, HID_CONSUMER_REPORT_LEN);
 }
 
 /*********************************************************************
@@ -1302,10 +1382,7 @@ static void centralEventCB(gapRoleEvent_t* pEvent)
             centralDiscState = BLE_DISC_STATE_IDLE;
             centralCharHdl = 0;
             
-            centralReportFound = FALSE;
-            centralIsBootKbd = FALSE;
-            centralCharEndHdl = 0;
-            centralCCCDHdl = 0;
+            centralResetDiscoveryVars();
             centralSvcStartHdl = 0;
             centralSvcEndHdl = 0;
             centralBonded = FALSE;
@@ -1504,11 +1581,8 @@ static void centralStartDiscovery(void)
     uint8_t uuid[ATT_BT_UUID_SIZE] = {LO_UINT16(HID_SERVICE_UUID),
         HI_UINT16(HID_SERVICE_UUID)};
 
+    centralResetDiscoveryVars();
     centralSvcStartHdl = centralSvcEndHdl = centralCharHdl = 0;
-    centralCCCDHdl = 0;
-    centralReportFound = FALSE;
-    centralIsBootKbd = FALSE;
-    centralCharEndHdl = 0;
 
     centralDiscState = BLE_DISC_STATE_SVC;
 
@@ -1522,9 +1596,10 @@ static void centralStartDiscovery(void)
  * @fn      centralGATTDiscoveryEvent
  *
  * @brief   GATT Discovery 응답 처리.
- *          - SVC  : 서비스 Handle 범위 획득 → Characteristic 탐색
- *          - CHAR : Characteristic 값 Handle 획득 → CCCD 탐색
- *          - CCCD : CCCD Handle 획득 → CCCD 에 Notify 설정 기록
+ *          - SVC        : 서비스 Handle 범위 획득 → Characteristic 탐색
+ *          - CHAR       : 모든 Notify 지원 Report Char 탐색 및 저장
+ *          - REPORT_REF : 각 Report의 Report Reference(0x2908) 읽기 (ID/Type 파악)
+ *          - CCCD       : 각 Report의 CCCD(0x2902) 탐색 → 완료 후 쓰기 예약
  *
  * @return  none
  */
@@ -1570,7 +1645,7 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
             }
         }
     }
-    /* ---------- 2단계 : Characteristic 파싱 → 키보드 Report 찾기 ---------- */
+    /* ---------- 2단계 : Characteristic 파싱 → 모든 Notify Report 찾기 ---------- */
     else if(centralDiscState == BLE_DISC_STATE_CHAR)
     {
         if(pMsg->method == ATT_READ_BY_TYPE_RSP &&
@@ -1591,25 +1666,41 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
                 PRINT("  Char: decl=%x props=%02X val=%x uuid=%04X\n",
                       charHdl, props, valueHdl, uuid);
 
-                /* ★ 첫 번째 Notify 지원 Report(0x2A4D) 를 우선 선택.
-                 *    (Report 가 없는 기기일 때만 Boot Keyboard Report(0x2A22) fallback)
-                 *    한 번 선택된 후에는 다른 Report 로 덮어쓰지 않는다. */
-                if(!centralReportFound &&
-                   (uuid == HID_REPORT_CHAR_UUID || uuid == BOOT_KEY_INPUT_UUID) &&
-                   (props & 0x10))               /* Notify bit */
+                /* 이전에 발견된 Report들의 endHandle 갱신 */
+                for(uint8_t r = 0; r < sDiscReportCount; r++)
                 {
-                    centralCharHdl = valueHdl;
-                    centralReportFound = TRUE;
-                    centralIsBootKbd = (uuid == BOOT_KEY_INPUT_UUID) ? TRUE : FALSE;
-                    centralCharEndHdl = 0;
-                    PRINT("  → Selected %s val handle = %x (props=%02X)\n",
-                          (uuid == BOOT_KEY_INPUT_UUID) ? "Boot Keyboard" : "Report",
-                          valueHdl, props);
+                    if(sDiscReports[r].endHandle == 0 && charHdl > sDiscReports[r].valueHandle)
+                    {
+                        sDiscReports[r].endHandle = charHdl - 1;
+                    }
                 }
-                else if(centralReportFound && centralCharEndHdl == 0 && charHdl > centralCharHdl)
+
+                /* Notify를 지원하는 Report (0x2A4D) 또는 Boot Keyboard Report (0x2A22) 탐색 및 저장 */
+                if((uuid == HID_REPORT_CHAR_UUID || uuid == BOOT_KEY_INPUT_UUID) &&
+                   (props & 0x10)) /* Notify bit */
                 {
-                    /* 선택된 특성 이후에 나타난 다음 특성 선언의 직전 핸들을 경계로 설정 */
-                    centralCharEndHdl = charHdl - 1;
+                    if(sDiscReportCount < MAX_DISC_REPORTS)
+                    {
+                        sDiscReports[sDiscReportCount].declHandle = charHdl;
+                        sDiscReports[sDiscReportCount].valueHandle = valueHdl;
+                        sDiscReports[sDiscReportCount].endHandle = 0;
+                        sDiscReports[sDiscReportCount].props = props;
+                        sDiscReports[sDiscReportCount].reportId = 0xFF;
+                        sDiscReports[sDiscReportCount].reportType = (uuid == BOOT_KEY_INPUT_UUID) ? 1 : 0;
+                        sDiscReports[sDiscReportCount].cccdHandle = 0;
+                        sDiscReports[sDiscReportCount].cccdEnabled = FALSE;
+                        sDiscReportCount++;
+
+                        PRINT("  → Saved Report[%d] val=%x uuid=%04X\n",
+                              sDiscReportCount - 1, valueHdl, uuid);
+                    }
+
+                    if(!centralReportFound)
+                    {
+                        centralCharHdl = valueHdl;
+                        centralReportFound = TRUE;
+                        centralIsBootKbd = (uuid == BOOT_KEY_INPUT_UUID) ? TRUE : FALSE;
+                    }
                 }
             }
         }
@@ -1618,45 +1709,139 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
             pMsg->hdr.status == bleProcedureComplete) ||
            (pMsg->method == ATT_ERROR_RSP))
         {
-            if(!centralReportFound)
+            if(sDiscReportCount == 0 && !centralReportFound)
             {
                 PRINT("Report char not found\n");
                 centralDiscState = BLE_DISC_STATE_IDLE;
             }
             else
             {
-                if(centralCharEndHdl == 0 || centralCharEndHdl < centralCharHdl)
+                /* 아직 endHandle이 지정되지 않은 Report들을 centralSvcEndHdl로 채움 */
+                for(uint8_t r = 0; r < sDiscReportCount; r++)
                 {
-                    centralCharEndHdl = centralSvcEndHdl;
+                    if(sDiscReports[r].endHandle == 0 || sDiscReports[r].endHandle < sDiscReports[r].valueHandle)
+                    {
+                        sDiscReports[r].endHandle = centralSvcEndHdl;
+                    }
+                    PRINT("Report[%d]: val=%x, range=[%x, %x]\n",
+                          r, sDiscReports[r].valueHandle,
+                          sDiscReports[r].valueHandle + 1, sDiscReports[r].endHandle);
                 }
 
-                centralDiscState = BLE_DISC_STATE_CCCD;
+                /* 3단계: Report Reference Descriptor (0x2908) 읽기로 전이 */
+                sDiscReportIdx = 0;
+                centralDiscState = BLE_DISC_STATE_REPORT_REF;
 
-                req.startHandle = centralCharHdl + 1;
-                req.endHandle = (centralCharEndHdl >= req.startHandle) ? centralCharEndHdl : req.startHandle;
+                req.startHandle = sDiscReports[0].valueHandle + 1;
+                req.endHandle = (sDiscReports[0].endHandle >= req.startHandle) ? sDiscReports[0].endHandle : req.startHandle;
                 req.type.len = ATT_BT_UUID_SIZE;
-                req.type.uuid[0] = LO_UINT16(GATT_CLIENT_CHAR_CFG_UUID);
-                req.type.uuid[1] = HI_UINT16(GATT_CLIENT_CHAR_CFG_UUID);
+                req.type.uuid[0] = LO_UINT16(HID_REPORT_REF_UUID);
+                req.type.uuid[1] = HI_UINT16(HID_REPORT_REF_UUID);
 
-                PRINT("Discover CCCD range [%x, %x]\n", req.startHandle, req.endHandle);
+                PRINT("Discover Report[%d] Ref (0x2908) range [%x, %x]\n",
+                      sDiscReportIdx, req.startHandle, req.endHandle);
                 GATT_ReadUsingCharUUID(centralConnHandle, &req, centralTaskId);
             }
         }
     }
-    /* ---------- 3단계 : CCCD 찾기 ---------- */
+    /* ---------- 3단계 : Report Reference (0x2908) 읽기 ---------- */
+    else if(centralDiscState == BLE_DISC_STATE_REPORT_REF)
+    {
+        if(pMsg->method == ATT_READ_BY_TYPE_RSP &&
+           pMsg->msg.readByTypeRsp.numPairs > 0)
+        {
+            /* data: [0..1]=handle, [2]=reportId, [3]=reportType */
+            uint8_t pairLen = pMsg->msg.readByTypeRsp.len;
+            if(pairLen >= 4 && sDiscReportIdx < sDiscReportCount)
+            {
+                uint8_t* p = pMsg->msg.readByTypeRsp.pDataList;
+                sDiscReports[sDiscReportIdx].reportId = p[2];
+                sDiscReports[sDiscReportIdx].reportType = p[3];
+                PRINT("  Report[%d] Ref: ID=%d, Type=%d\n",
+                      sDiscReportIdx, p[2], p[3]);
+            }
+        }
+
+        if((pMsg->method == ATT_READ_BY_TYPE_RSP &&
+            pMsg->hdr.status == bleProcedureComplete) ||
+           (pMsg->method == ATT_ERROR_RSP))
+        {
+            sDiscReportIdx++;
+            if(sDiscReportIdx < sDiscReportCount)
+            {
+                /* 다음 Report의 Report Reference 읽기 */
+                req.startHandle = sDiscReports[sDiscReportIdx].valueHandle + 1;
+                req.endHandle = (sDiscReports[sDiscReportIdx].endHandle >= req.startHandle) ? sDiscReports[sDiscReportIdx].endHandle : req.startHandle;
+                req.type.len = ATT_BT_UUID_SIZE;
+                req.type.uuid[0] = LO_UINT16(HID_REPORT_REF_UUID);
+                req.type.uuid[1] = HI_UINT16(HID_REPORT_REF_UUID);
+
+                PRINT("Discover Report[%d] Ref (0x2908) range [%x, %x]\n",
+                      sDiscReportIdx, req.startHandle, req.endHandle);
+                GATT_ReadUsingCharUUID(centralConnHandle, &req, centralTaskId);
+            }
+            else
+            {
+                /* 모든 Report Ref 읽기 완료 → 4단계: CCCD 탐색으로 전이 */
+                sDiscReportIdx = 0;
+                centralDiscState = BLE_DISC_STATE_CCCD;
+
+                req.startHandle = sDiscReports[0].valueHandle + 1;
+                req.endHandle = (sDiscReports[0].endHandle >= req.startHandle) ? sDiscReports[0].endHandle : req.startHandle;
+                req.type.len = ATT_BT_UUID_SIZE;
+                req.type.uuid[0] = LO_UINT16(GATT_CLIENT_CHAR_CFG_UUID);
+                req.type.uuid[1] = HI_UINT16(GATT_CLIENT_CHAR_CFG_UUID);
+
+                PRINT("Discover Report[%d] CCCD range [%x, %x]\n",
+                      sDiscReportIdx, req.startHandle, req.endHandle);
+                GATT_ReadUsingCharUUID(centralConnHandle, &req, centralTaskId);
+            }
+        }
+    }
+    /* ---------- 4단계 : CCCD 찾기 ---------- */
     else if(centralDiscState == BLE_DISC_STATE_CCCD)
     {
-        if(pMsg->method == ATT_READ_BY_TYPE_RSP)
+        if(pMsg->method == ATT_READ_BY_TYPE_RSP &&
+           pMsg->msg.readByTypeRsp.numPairs > 0)
         {
-           if(pMsg->msg.readByTypeRsp.numPairs > 0)
+            if(sDiscReportIdx < sDiscReportCount)
             {
-                centralCCCDHdl = BUILD_UINT16(pMsg->msg.readByTypeRsp.pDataList[0],
-                                            pMsg->msg.readByTypeRsp.pDataList[1]);
-                PRINT("Report CCCD handle : %x\n", centralCCCDHdl);
+                uint16_t cccdHdl = BUILD_UINT16(pMsg->msg.readByTypeRsp.pDataList[0],
+                                               pMsg->msg.readByTypeRsp.pDataList[1]);
+                sDiscReports[sDiscReportIdx].cccdHandle = cccdHdl;
+                if(sDiscReportIdx == 0)
+                {
+                    centralCCCDHdl = cccdHdl;
+                }
+                PRINT("Report[%d] CCCD handle : %x\n", sDiscReportIdx, cccdHdl);
+            }
+        }
 
-                /* ★ 여기서는 바로 쓰지 않는다.
-                *   페어링이 이미 끝난 상태(재연결)라면 바로 쓰고,
-                *   아니면 centralPairStateCB 에서 쓰도록 미룬다. */
+        if((pMsg->method == ATT_READ_BY_TYPE_RSP &&
+            pMsg->hdr.status == bleProcedureComplete) ||
+           (pMsg->method == ATT_ERROR_RSP))
+        {
+            sDiscReportIdx++;
+            if(sDiscReportIdx < sDiscReportCount)
+            {
+                /* 다음 Report의 CCCD 탐색 */
+                req.startHandle = sDiscReports[sDiscReportIdx].valueHandle + 1;
+                req.endHandle = (sDiscReports[sDiscReportIdx].endHandle >= req.startHandle) ? sDiscReports[sDiscReportIdx].endHandle : req.startHandle;
+                req.type.len = ATT_BT_UUID_SIZE;
+                req.type.uuid[0] = LO_UINT16(GATT_CLIENT_CHAR_CFG_UUID);
+                req.type.uuid[1] = HI_UINT16(GATT_CLIENT_CHAR_CFG_UUID);
+
+                PRINT("Discover Report[%d] CCCD range [%x, %x]\n",
+                      sDiscReportIdx, req.startHandle, req.endHandle);
+                GATT_ReadUsingCharUUID(centralConnHandle, &req, centralTaskId);
+            }
+            else
+            {
+                /* 모든 CCCD 탐색 완료 */
+                centralDiscState = BLE_DISC_STATE_IDLE;
+                PRINT("All Report CCCD discovery completed\n");
+
+                /* 페어링이 이미 끝난 상태라면 바로 CCCD Write 예약 */
                 if(centralBonded)
                 {
                     centralProcedureInProgress = FALSE;
@@ -1668,12 +1853,6 @@ static void centralGATTDiscoveryEvent(gattMsgEvent_t* pMsg)
                     PRINT("Wait pairing before CCCD write...\n");
                 }
             }
-            centralDiscState = BLE_DISC_STATE_IDLE;
-        }
-        else if(pMsg->method == ATT_ERROR_RSP)
-        {
-            PRINT("CCCD not found\n");
-            centralDiscState = BLE_DISC_STATE_IDLE;
         }
     }
 }

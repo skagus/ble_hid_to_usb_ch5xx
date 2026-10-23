@@ -10,8 +10,8 @@ const uint8_t MyDevDescr[] = {0x12, 0x01, 0x10, 0x01, 0x00, 0x00, 0x00, DevEP0SI
 const uint8_t MyCfgDescr[] = {
     0x09, 0x02, 0x22, 0x00, 0x01, 0x01, 0x00, 0xA0, 0x32, // Configuration descriptor (총 0x22, 1 interface)
     0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x01, 0x00, // Interface descriptor, keyboard
-    0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x3e, 0x00, // HID class descriptor
-    0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a              // Endpoint descriptor (EP1 IN)
+    0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x59, 0x00, // HID class descriptor (wDescriptorLength=0x59=89)
+    0x07, 0x05, 0x81, 0x03, 0x09, 0x00, 0x0a              // Endpoint descriptor (EP1 IN, wMaxPacketSize=9)
 };
 
 /* USB speed matching descriptor */
@@ -28,12 +28,65 @@ const uint8_t MyLangDescr[] = {0x04, 0x03, 0x09, 0x04};
 const uint8_t MyManuInfo[] = {0x0E, 0x03, 'w', 0, 'c', 0, 'h', 0, '.', 0, 'c', 0, 'n', 0};
 // Product info
 const uint8_t MyProdInfo[] = {0x0C, 0x03, 'C', 0, 'H', 0, '5', 0, '7', 0, 'x', 0};
-/* HID class report descriptor */
-const uint8_t KeyRepDesc[] = {0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25,
-0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x03,
-0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x03, 0x91, 0x02, 0x95, 0x05, 0x75, 0x01, 0x91,
-0x01, 0x95, 0x06, 0x75, 0x08, 0x26, 0xff, 0x00, 0x05, 0x07, 0x19, 0x00, 0x29, 0x91, 0x81,
-0x00, 0xC0};
+/* HID class report descriptor
+ * Report ID 1 : Keyboard  - 8바이트 표준 키보드 리포트
+ * Report ID 2 : Consumer Control - 2바이트 미디어 키 리포트
+ * 총 89 = 0x59바이트
+ */
+const uint8_t KeyRepDesc[] = {
+    /* === Report ID 1: Keyboard === */
+    0x05, 0x01,        /* Usage Page (Generic Desktop)         */
+    0x09, 0x06,        /* Usage (Keyboard)                     */
+    0xA1, 0x01,        /* Collection (Application)             */
+    0x85, 0x01,        /*   Report ID (1)                      */
+    /* Modifier keys: 8비트 */
+    0x05, 0x07,        /*   Usage Page (Key Codes)             */
+    0x19, 0xe0,        /*   Usage Minimum (224)                */
+    0x29, 0xe7,        /*   Usage Maximum (231)                */
+    0x15, 0x00,        /*   Logical Minimum (0)                */
+    0x25, 0x01,        /*   Logical Maximum (1)                */
+    0x75, 0x01,        /*   Report Size (1)                    */
+    0x95, 0x08,        /*   Report Count (8)                   */
+    0x81, 0x02,        /*   Input (Data, Variable, Absolute)   */
+    /* Reserved byte */
+    0x95, 0x01,        /*   Report Count (1)                   */
+    0x75, 0x08,        /*   Report Size (8)                    */
+    0x81, 0x01,        /*   Input (Constant)                   */
+    /* LED 출력: 3비트 (Num, Caps, Scroll Lock) */
+    0x95, 0x03,        /*   Report Count (3)                   */
+    0x75, 0x01,        /*   Report Size (1)                    */
+    0x05, 0x08,        /*   Usage Page (LEDs)                  */
+    0x19, 0x01,        /*   Usage Minimum (1)                  */
+    0x29, 0x03,        /*   Usage Maximum (3)                  */
+    0x91, 0x02,        /*   Output (Data, Variable, Absolute)  */
+    /* LED 패딩: 5비트 */
+    0x95, 0x05,        /*   Report Count (5)                   */
+    0x75, 0x01,        /*   Report Size (1)                    */
+    0x91, 0x01,        /*   Output (Constant)                  */
+    /* Key array: 6바이트 */
+    0x95, 0x06,        /*   Report Count (6)                   */
+    0x75, 0x08,        /*   Report Size (8)                    */
+    0x26, 0xff, 0x00,  /*   Logical Maximum (255)              */
+    0x05, 0x07,        /*   Usage Page (Key Codes)             */
+    0x19, 0x00,        /*   Usage Minimum (0)                  */
+    0x29, 0x91,        /*   Usage Maximum (145)                */
+    0x81, 0x00,        /*   Input (Data, Array, Absolute)      */
+    0xC0,              /* End Collection                       */
+
+    /* === Report ID 2: Consumer Control (미디어 키) === */
+    0x05, 0x0C,        /* Usage Page (Consumer)                */
+    0x09, 0x01,        /* Usage (Consumer Control)             */
+    0xA1, 0x01,        /* Collection (Application)             */
+    0x85, 0x02,        /*   Report ID (2)                      */
+    0x15, 0x00,        /*   Logical Minimum (0)                */
+    0x26, 0xFF, 0x03,  /*   Logical Maximum (1023)             */
+    0x19, 0x00,        /*   Usage Minimum (0)                  */
+    0x2A, 0xFF, 0x03,  /*   Usage Maximum (1023)               */
+    0x75, 0x10,        /*   Report Size (16)                   */
+    0x95, 0x01,        /*   Report Count (1)                   */
+    0x81, 0x00,        /*   Input (Data, Array, Absolute)      */
+    0xC0               /* End Collection                       */
+};
 
 /**********************************************************/
 uint8_t        DevConfig, Ready;
@@ -44,15 +97,17 @@ uint8_t        Report_Value = 0x00; // Keep track of the current protocol (0=Boo
 uint8_t        Idle_Value = 0x00; // Keep track of the current idle rate (in 4ms units)
 uint8_t        USB_SleepStatus = 0x00; // USB sleep 상태
 
-/* 마우스/키보드 데이터 */
-uint8_t HIDKey[8] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+/* HID 리포트 프레임 (Report ID + 데이터, 최대 9바이트) */
+#define HID_REPORT_FRAME_MAX    (HID_KEYBOARD_REPORT_LEN + 1)  /* Report ID(1) + 키보드(8) */
+
+typedef struct {
+    uint8_t len;                        /* 실제 전송 바이트 수 */
+    uint8_t data[HID_REPORT_FRAME_MAX]; /* Report ID + payload */
+} hid_report_frame_t;
 
 #define KEY_REPORT_QUEUE_SIZE 16
-typedef struct {
-    uint8_t report[HID_KEYBOARD_REPORT_LEN];
-} key_report_t;
 
-static key_report_t sKeyReportQueue[KEY_REPORT_QUEUE_SIZE];
+static hid_report_frame_t sKeyReportQueue[KEY_REPORT_QUEUE_SIZE];
 static volatile uint8_t sKeyQueueHead = 0;
 static volatile uint8_t sKeyQueueTail = 0;
 static volatile uint8_t sKeyEP1Busy = 0;
@@ -132,16 +187,17 @@ void USB_DevTransProcess(void)
                 }
 
 
-                case UIS_TOKEN_IN | 1:   // Keyboard IN
+                case UIS_TOKEN_IN | 1:   // Keyboard / Consumer IN
                 {
                     R8_UEP1_CTRL ^= RB_UEP_T_TOG;
                     R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
 
                     if(sKeyQueueHead != sKeyQueueTail)
                     {
-                        memcpy(pEP1_IN_DataBuf, sKeyReportQueue[sKeyQueueTail].report, HID_KEYBOARD_REPORT_LEN);
+                        uint8_t flen = sKeyReportQueue[sKeyQueueTail].len;
+                        memcpy(pEP1_IN_DataBuf, sKeyReportQueue[sKeyQueueTail].data, flen);
                         sKeyQueueTail = (sKeyQueueTail + 1) % KEY_REPORT_QUEUE_SIZE;
-                        DevEP1_IN_Deal(HID_KEYBOARD_REPORT_LEN);
+                        DevEP1_IN_Deal(flen);
                     }
                     else
                     {
@@ -352,10 +408,11 @@ void USB_DevTransProcess(void)
                                 R8_UEP1_CTRL = (R8_UEP1_CTRL & ~(RB_UEP_T_TOG | MASK_UEP_T_RES)) | UEP_T_RES_NAK;
                                 if(sKeyQueueHead != sKeyQueueTail)
                                 {
-                                    memcpy(pEP1_IN_DataBuf, sKeyReportQueue[sKeyQueueTail].report, HID_KEYBOARD_REPORT_LEN);
+                                    uint8_t flen = sKeyReportQueue[sKeyQueueTail].len;
+                                    memcpy(pEP1_IN_DataBuf, sKeyReportQueue[sKeyQueueTail].data, flen);
                                     sKeyQueueTail = (sKeyQueueTail + 1) % KEY_REPORT_QUEUE_SIZE;
                                     sKeyEP1Busy = 1;
-                                    DevEP1_IN_Deal(HID_KEYBOARD_REPORT_LEN);
+                                    DevEP1_IN_Deal(flen);
                                 }
                                 else
                                 {
@@ -584,58 +641,104 @@ void DevHIDMouseReport(uint8_t mouse)
 }
 #endif
 
+/*--------------------------------------------------------------------
+ * 내부 헬퍼: 프레임을 EP1 전송 큐에 적재하거나 즉시 전송
+ * USB IRQ 비활성화 상태에서 호출해야 함.
+ *------------------------------------------------------------------*/
+static void sHIDReportEnqueue(const hid_report_frame_t *pFrame)
+{
+    if(!sKeyEP1Busy)
+    {
+        /* 전송 중이 아니면 즉시 DMA 버퍼에 복사 후 전송 */
+        memcpy(pEP1_IN_DataBuf, pFrame->data, pFrame->len);
+        sKeyEP1Busy = 1;
+        DevEP1_IN_Deal(pFrame->len);
+    }
+    else
+    {
+        /* 전송 중이면 큐에 적재 */
+        uint8_t nextHead = (sKeyQueueHead + 1) % KEY_REPORT_QUEUE_SIZE;
+        if(nextHead != sKeyQueueTail)
+        {
+            sKeyReportQueue[sKeyQueueHead] = *pFrame;
+            sKeyQueueHead = nextHead;
+        }
+        else
+        {
+            /* 큐 오버플로우: 최신 상태 유지를 위해 마지막 슬롯 갱신 */
+            uint8_t lastIdx = (sKeyQueueHead + KEY_REPORT_QUEUE_SIZE - 1) % KEY_REPORT_QUEUE_SIZE;
+            sKeyReportQueue[lastIdx] = *pFrame;
+        }
+    }
+}
+
 /*********************************************************************
  * @fn      DevHIDKeyReport
  *
- * @brief   키보드 데이터 보고 (전송 큐를 통해 호스트 수신 전 덮어쓰기 방지)
+ * @brief   키보드 리포트 전송 (Report ID 1 + 8바이트 키보드 데이터)
+ *
+ * @param   aKey  - 키보드 리포트 데이터 포인터
+ * @param   nLen  - 데이터 길이 (최대 HID_KEYBOARD_REPORT_LEN)
  *
  * @return  none
  */
 void DevHIDKeyReport(uint8_t* aKey, uint8_t nLen)
 {
-    uint8_t tempReport[HID_KEYBOARD_REPORT_LEN];
-    uint8_t nextHead;
+    hid_report_frame_t frame;
 
-#if 1
-    PRINT("[hdl=%04X] len=%d : ", aKey, nLen);
-    for(uint8_t k = 0; k < nLen; k++) PRINT("%02X ", aKey[k]);
-    PRINT("\n");
-#endif
-
-
-    memset(tempReport, 0, HID_KEYBOARD_REPORT_LEN);
+    /* Report ID 1(키보드) + 8바이트 키 데이터 */
+    frame.len      = HID_KEYBOARD_REPORT_LEN + 1;
+    frame.data[0]  = HID_REPORT_ID_KBD;
+    memset(frame.data + 1, 0, HID_KEYBOARD_REPORT_LEN);
     if(aKey != NULL && nLen > 0)
     {
         if(nLen > HID_KEYBOARD_REPORT_LEN) nLen = HID_KEYBOARD_REPORT_LEN;
-        memcpy(tempReport, aKey, nLen);
+        memcpy(frame.data + 1, aKey, nLen);
     }
+
+#if 1
+    PRINT("[KBD] ");
+    for(uint8_t k = 0; k < frame.len; k++) PRINT("%02X ", frame.data[k]);
+    PRINT("\n");
+#endif
 
     PFIC_DisableIRQ(USB_IRQn);
+    sHIDReportEnqueue(&frame);
+    PFIC_EnableIRQ(USB_IRQn);
+}
 
-    if(!sKeyEP1Busy)
+/*********************************************************************
+ * @fn      DevHIDConsumerReport
+ *
+ * @brief   Consumer Control 리포트 전송 (Report ID 2 + 2바이트 Usage 코드)
+ *          미디어 키(재생/정지, 볼륨, 다음 트랙 등) 전송에 사용.
+ *
+ * @param   aConsumer - Consumer Usage 코드 2바이트 배열 [low, high]
+ * @param   nLen      - 데이터 길이 (최대 HID_CONSUMER_REPORT_LEN)
+ *
+ * @return  none
+ */
+void DevHIDConsumerReport(uint8_t* aConsumer, uint8_t nLen)
+{
+    hid_report_frame_t frame;
+
+    /* Report ID 2(Consumer) + 2바이트 Usage 코드 */
+    frame.len      = HID_CONSUMER_REPORT_LEN + 1;
+    frame.data[0]  = HID_REPORT_ID_CONSUMER;
+    frame.data[1]  = 0;
+    frame.data[2]  = 0;
+    if(aConsumer != NULL && nLen > 0)
     {
-        /* 전송 중이 아니면 즉시 DMA 버퍼로 복사 후 전송 */
-        memcpy(pEP1_IN_DataBuf, tempReport, HID_KEYBOARD_REPORT_LEN);
-        sKeyEP1Busy = 1;
-        DevEP1_IN_Deal(HID_KEYBOARD_REPORT_LEN);
-    }
-    else
-    {
-        /* 이미 전송 중이면 큐에 적재하여 다음 완료 인터럽트에서 전송 */
-        nextHead = (sKeyQueueHead + 1) % KEY_REPORT_QUEUE_SIZE;
-        if(nextHead != sKeyQueueTail)
-        {
-            memcpy(sKeyReportQueue[sKeyQueueHead].report, tempReport, HID_KEYBOARD_REPORT_LEN);
-            sKeyQueueHead = nextHead;
-        }
-        else
-        {
-            /* 큐 오버플로우 시 최신 상태 보존을 위해 마지막 슬롯 갱신 */
-            uint8_t lastIdx = (sKeyQueueHead + KEY_REPORT_QUEUE_SIZE - 1) % KEY_REPORT_QUEUE_SIZE;
-            memcpy(sKeyReportQueue[lastIdx].report, tempReport, HID_KEYBOARD_REPORT_LEN);
-        }
+        if(nLen > HID_CONSUMER_REPORT_LEN) nLen = HID_CONSUMER_REPORT_LEN;
+        memcpy(frame.data + 1, aConsumer, nLen);
     }
 
+#if 1
+    PRINT("[CSM] %02X %02X %02X\n", frame.data[0], frame.data[1], frame.data[2]);
+#endif
+
+    PFIC_DisableIRQ(USB_IRQn);
+    sHIDReportEnqueue(&frame);
     PFIC_EnableIRQ(USB_IRQn);
 }
 
